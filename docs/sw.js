@@ -1,4 +1,4 @@
-const CACHE_VERSION = "dojo-static-v1";
+const CACHE_VERSION = "dojo-static-v2";
 const APP_ASSETS = [
   "./index.html",
   "./styles.css",
