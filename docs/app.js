@@ -810,29 +810,139 @@ function renderToday() {
   `;
 }
 
-function renderChart(data, label) {
-  if (!data.length) {
-    return `<div class="chart"><div class="chart-header"><span>${label}</span><span class="chart-range">No data</span></div></div>`;
+function formatDateLabel(timestamp) {
+  return new Date(timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function buildTimeSeries(logs, valueFn) {
+  return logs
+    .map((log) => ({ x: log.timestamp, y: valueFn(log) }))
+    .filter((point) => Number.isFinite(point.y))
+    .sort((a, b) => a.x - b.x);
+}
+
+function buildRollingVolumeSeries(logs, windowDays, now) {
+  if (!logs.length) return [];
+  const windowStart = now - windowDays * DAY_MS;
+  const startOfDay = (timestamp) => {
+    const date = new Date(timestamp);
+    date.setHours(0, 0, 0, 0);
+    return date.getTime();
+  };
+  const dayTotals = new Map();
+  const volumeValue = (log) => {
+    if (log.durationSec) return log.durationSec;
+    if (log.loadKg) return (log.reps ?? 0) * log.loadKg;
+    return log.reps ?? 0;
+  };
+  const volumeLogs = logs.filter((log) => log.timestamp >= windowStart - 6 * DAY_MS && log.timestamp <= now);
+  if (!volumeLogs.length) return [];
+  volumeLogs.forEach((log) => {
+    const day = startOfDay(log.timestamp);
+    const value = volumeValue(log);
+    if (!Number.isFinite(value)) return;
+    dayTotals.set(day, (dayTotals.get(day) ?? 0) + value);
+  });
+  const points = [];
+  const startDay = startOfDay(windowStart);
+  const endDay = startOfDay(now);
+  for (let day = startDay; day <= endDay; day += DAY_MS) {
+    let rollingSum = 0;
+    for (let offset = 0; offset < 7; offset += 1) {
+      const target = day - offset * DAY_MS;
+      rollingSum += dayTotals.get(target) ?? 0;
+    }
+    points.push({ x: day, y: rollingSum });
   }
-  const minY = Math.min(...data.map((d) => d.y));
-  const maxY = Math.max(...data.map((d) => d.y));
-  const range = maxY - minY || 1;
-  const points = data
-    .map((point, index) => {
-      const x = (index / (data.length - 1 || 1)) * 100;
-      const y = ((maxY - point.y) / range) * 120;
-      return `${x},${y}`;
-    })
-    .join(" ");
+  return points;
+}
+
+function buildSmoothPath(points) {
+  if (points.length < 2) return "";
+  if (points.length === 2) {
+    return `M ${points[0].x},${points[0].y} L ${points[1].x},${points[1].y}`;
+  }
+  let path = `M ${points[0].x},${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const curr = points[i];
+    const next = points[i + 1];
+    const midX = (curr.x + next.x) / 2;
+    const midY = (curr.y + next.y) / 2;
+    path += ` Q ${curr.x},${curr.y} ${midX},${midY}`;
+  }
+  const last = points[points.length - 1];
+  path += ` T ${last.x},${last.y}`;
+  return path;
+}
+
+function renderChart(series, label) {
+  if (!series.length) {
+    return `
+      <div class="chart">
+        <div class="chart-header"><span>${label}</span><span class="chart-range">No data</span></div>
+        <div class="chart-empty">No data yet</div>
+      </div>
+    `;
+  }
+
+  const sorted = [...series].sort((a, b) => a.x - b.x);
+  const minX = Math.min(...sorted.map((point) => point.x));
+  const maxX = Math.max(...sorted.map((point) => point.x));
+  const minY = Math.min(...sorted.map((point) => point.y));
+  const maxY = Math.max(...sorted.map((point) => point.y));
+  const baseRange = maxY - minY || 1;
+  const verticalPadding = Math.max(baseRange * 0.1, 1);
+  const yMin = minY - verticalPadding;
+  const yMax = maxY + verticalPadding;
+  const yRange = yMax - yMin || 1;
+
+  const width = 100;
+  const height = 140;
+  const padding = { top: 8, right: 6, bottom: 26, left: 8 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const xScale = (value) => padding.left + ((value - minX) / (maxX - minX || 1)) * plotWidth;
+  const yScale = (value) => padding.top + ((yMax - value) / yRange) * plotHeight;
+
+  const chartPoints = sorted.map((point) => ({ x: xScale(point.x), y: yScale(point.y) }));
+  const linePath = chartPoints.length > 1 ? buildSmoothPath(chartPoints) : "";
+
+  const gridLines = Array.from({ length: 5 }, (_, index) => {
+    const y = padding.top + (plotHeight / 4) * index;
+    return `<line class="chart-grid-line" x1="${padding.left}" y1="${y}" x2="${padding.left + plotWidth}" y2="${y}" />`;
+  }).join("");
+  const verticalGridLines = Array.from({ length: 3 }, (_, index) => {
+    const x = padding.left + (plotWidth / 2) * index;
+    return `<line class="chart-grid-line" x1="${x}" y1="${padding.top}" x2="${x}" y2="${padding.top + plotHeight}" />`;
+  }).join("");
+
+  const tickTimes = maxX === minX ? [minX] : [minX, minX + (maxX - minX) / 2, maxX];
+  const xTicks = tickTimes.map((time, index) => {
+    const x = xScale(time);
+    const anchor = index === 0 ? "start" : index === tickTimes.length - 1 ? "end" : "middle";
+    return `<text class="chart-axis-label" x="${x}" y="${padding.top + plotHeight + 16}" text-anchor="${anchor}">${formatDateLabel(time)}</text>`;
+  }).join("");
 
   return `
     <div class="chart">
       <div class="chart-header">
         <span>${label}</span>
-        <span class="chart-range">${formatNumber(minY)} - ${formatNumber(maxY)}</span>
+        <span class="chart-range">${formatNumber(yMin)} - ${formatNumber(yMax)}</span>
       </div>
-      <svg viewBox="0 0 100 120" preserveAspectRatio="none">
-        <polyline points="${points}" fill="none" stroke="currentColor" stroke-width="3"></polyline>
+      <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+        <g class="chart-grid">
+          ${gridLines}
+          ${verticalGridLines}
+        </g>
+        ${linePath ? `<path class="chart-line" d="${linePath}" />` : ""}
+        <g class="chart-points">
+          ${chartPoints.map((point) => `<circle class="chart-point" cx="${point.x}" cy="${point.y}" r="2.3" />`).join("")}
+        </g>
+        <g class="chart-axis">
+          <text class="chart-axis-label" x="${padding.left}" y="${padding.top + 4}" text-anchor="start">${formatNumber(yMax)}</text>
+          <text class="chart-axis-label" x="${padding.left}" y="${padding.top + plotHeight}" text-anchor="start">${formatNumber(yMin)}</text>
+          ${xTicks}
+        </g>
       </svg>
     </div>
   `;
@@ -850,21 +960,21 @@ function renderAnalytics() {
   const hydrated = exercise ? hydrateExercise(exercise) : null;
   const stats = hydrated ? hydrated.computeStats(windowedLogs, windowDays) : null;
 
-  const metricSeries = windowedLogs.map((log, index) => ({
-    x: index,
-    y: log.durationSec ? log.durationSec : (log.reps ?? 0),
-  }));
-  const loadSeries = windowedLogs.filter((log) => log.loadKg).map((log, index) => ({ x: index, y: log.loadKg }));
-  const rirSeries = windowedLogs.filter((log) => log.rir !== undefined).map((log, index) => ({ x: index, y: log.rir }));
-  const painSeries = windowedLogs.filter((log) => log.pain0to10 !== undefined).map((log, index) => ({ x: index, y: log.pain0to10 }));
-  const volumeSeries = windowedLogs.map((log, index) => ({
-    x: index,
-    y: log.durationSec
-      ? log.durationSec
-      : log.loadKg
-        ? (log.reps ?? 0) * (log.loadKg ?? 0)
-        : (log.reps ?? 0),
-  }));
+  const primaryMetricType = hydrated?.getPrimaryMetricType?.();
+  const metricSeries = buildTimeSeries(windowedLogs, (log) => {
+    if (primaryMetricType === "weightedReps") {
+      if (!log.loadKg || !log.reps) return undefined;
+      return log.loadKg * (1 + log.reps / 30);
+    }
+    if (primaryMetricType === "isometric") {
+      return log.durationSec;
+    }
+    return log.reps;
+  });
+  const loadSeries = buildTimeSeries(windowedLogs.filter((log) => log.loadKg), (log) => log.loadKg);
+  const rirSeries = buildTimeSeries(windowedLogs.filter((log) => log.rir !== undefined), (log) => log.rir);
+  const painSeries = buildTimeSeries(windowedLogs.filter((log) => log.pain0to10 !== undefined), (log) => log.pain0to10);
+  const volumeSeries = buildRollingVolumeSeries(filteredLogs, windowDays, now);
 
   return `
     <div class="page">
@@ -892,7 +1002,7 @@ function renderAnalytics() {
           ${loadSeries.length ? renderChart(loadSeries, "Load (kg)") : ""}
           ${renderChart(rirSeries, "RIR")}
           ${renderChart(painSeries, "Pain")}
-          ${renderChart(volumeSeries, "Weekly volume")}
+          ${renderChart(volumeSeries, "7-day volume")}
         </div>
       </section>
 

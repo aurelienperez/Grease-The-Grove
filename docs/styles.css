@@ -307,15 +307,14 @@ input:focus-visible,
 
 .chart {
   background: var(--surface-alt);
-  padding: 12px;
+  padding: 16px;
   border-radius: 12px;
   border: 1px solid var(--border);
 }
 
 .chart svg {
   width: 100%;
-  height: 120px;
-  color: var(--accent-2);
+  height: 160px;
 }
 
 .chart-header {
@@ -323,6 +322,46 @@ input:focus-visible,
   justify-content: space-between;
   font-size: 0.85rem;
   margin-bottom: 8px;
+}
+
+.chart-range {
+  color: var(--muted);
+}
+
+.chart-empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 18px 12px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.35);
+  border: 1px dashed var(--border);
+}
+
+.chart-grid-line {
+  stroke: var(--border);
+  stroke-width: 0.6;
+  opacity: 0.6;
+}
+
+.chart-line {
+  fill: none;
+  stroke: rgba(129, 140, 248, 0.9);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 4px rgba(129, 140, 248, 0.35));
+}
+
+.chart-point {
+  fill: var(--accent);
+  stroke: #0b1220;
+  stroke-width: 0.6;
+}
+
+.chart-axis-label {
+  fill: var(--muted);
+  font-size: 4.5px;
+  font-weight: 600;
 }
 
 .toast-stack {
