@@ -1,6 +1,81 @@
 const appEl = document.getElementById("app");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+function renderCrashCard(error, context) {
+  if (!appEl) return;
+  const message = error?.message ?? String(error ?? "Unknown error");
+  const stack = error?.stack;
+  appEl.innerHTML = "";
+  appEl.style.minHeight = "100vh";
+  appEl.style.display = "flex";
+  appEl.style.alignItems = "center";
+  appEl.style.justifyContent = "center";
+  appEl.style.padding = "24px";
+  appEl.style.background = "#0f172a";
+  appEl.style.color = "#e2e8f0";
+
+  const card = document.createElement("div");
+  card.style.maxWidth = "720px";
+  card.style.width = "100%";
+  card.style.background = "#111827";
+  card.style.border = "1px solid #334155";
+  card.style.borderRadius = "16px";
+  card.style.padding = "24px";
+  card.style.boxShadow = "0 20px 40px rgba(15, 23, 42, 0.4)";
+
+  const title = document.createElement("h1");
+  title.textContent = "Something went wrong";
+  title.style.margin = "0 0 12px";
+  title.style.fontSize = "24px";
+  title.style.color = "#f8fafc";
+
+  const detail = document.createElement("p");
+  detail.textContent = `${context}: ${message}`;
+  detail.style.margin = "0 0 16px";
+  detail.style.whiteSpace = "pre-wrap";
+
+  const stackEl = document.createElement("pre");
+  if (stack) {
+    stackEl.textContent = stack;
+    stackEl.style.margin = "0 0 16px";
+    stackEl.style.padding = "12px";
+    stackEl.style.background = "#0b1220";
+    stackEl.style.borderRadius = "12px";
+    stackEl.style.overflowX = "auto";
+    stackEl.style.color = "#cbd5f5";
+  }
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "Reset local data";
+  button.style.background = "#f97316";
+  button.style.color = "#0f172a";
+  button.style.border = "none";
+  button.style.padding = "12px 16px";
+  button.style.borderRadius = "999px";
+  button.style.fontWeight = "600";
+  button.style.cursor = "pointer";
+  button.onclick = () => resetAll();
+
+  card.append(title, detail);
+  if (stack) {
+    card.append(stackEl);
+  }
+  card.append(button);
+  appEl.append(card);
+}
+
+window.onerror = (message, source, lineno, colno, error) => {
+  console.error("Unhandled error", { message, source, lineno, colno, error });
+  renderCrashCard(error ?? message, "Application crashed");
+  return false;
+};
+
+window.onunhandledrejection = (event) => {
+  console.error("Unhandled rejection", event.reason);
+  renderCrashCard(event.reason, "Unhandled promise rejection");
+};
+
 const defaultProgression = {
   targetRirMin: 3,
   targetRirMax: 5,
