@@ -102,15 +102,25 @@ const state = {
   toastQueue: [],
 };
 
+const GTG_INTENSITY_PRESETS = {
+  easy: 0.4,
+  normal: 0.5,
+  hard: 0.6,
+};
+const INTENSITY_MIN = 0.3;
+const INTENSITY_MAX = 0.7;
+const DELOAD_DAYS = 7;
+
 class Exercise {
-  constructor({ id, name, category, tags = [], notes = "", variantsSchema = [], progressionProfile }) {
+  constructor({ id, name, category, tags = [], notes = "", variantsSchema = [], baseline = {}, deloadUntil = null }) {
     this.id = id;
     this.name = name;
     this.category = category;
     this.tags = tags;
     this.notes = notes;
     this.variantsSchema = variantsSchema;
-    this.progressionProfile = progressionProfile;
+    this.baseline = baseline ?? {};
+    this.deloadUntil = deloadUntil ?? null;
   }
 
   getPrimaryMetricType() {
@@ -133,9 +143,7 @@ class Exercise {
 class RepsExercise extends Exercise {
   constructor(input) {
     super(input);
-    this.repRange = input.repRange;
-    this.repIncrement = input.repIncrement ?? 1;
-    this.minRepsFloor = input.minRepsFloor ?? 1;
+    this.baseline = input.baseline ?? {};
   }
 
   getPrimaryMetricType() {
@@ -144,54 +152,23 @@ class RepsExercise extends Exercise {
 
   validateLog(log) {
     const errors = [];
-    if (log.status === "complete" && (!log.reps || log.reps <= 0)) {
-      errors.push("Reps are required for a complete set.");
+    if (log.status === "complete" && (!log.reps || log.reps < 1)) {
+      errors.push("Reps must be at least 1.");
     }
     return errors.length ? { valid: false, errors } : { valid: true };
   }
 
   computeNextTarget(logs, ctx) {
-    const { recentLogs, profile, explanation, frozen, deload } = getRecentCompleteLogs(
-      logs,
-      ctx,
-      this.progressionProfile
-    );
-    const recentRir = recentLogs.map((log) => log.rir).filter((rir) => rir !== undefined);
-    const medianRir = recentRir.length ? median(recentRir) : undefined;
-    const lastTarget = recentLogs[0]?.reps ?? this.repRange.min;
-    let nextReps = lastTarget;
-
-    if (!frozen && !deload && medianRir !== undefined) {
-      if (medianRir > profile.targetRirMax) {
-        nextReps += this.repIncrement;
-        explanation.push("Effort was easy; nudging reps up.");
-      } else if (medianRir < profile.targetRirMin) {
-        nextReps -= this.repIncrement;
-        explanation.push("Effort was high; reducing reps.");
-      }
-    }
-
-    nextReps = clamp(nextReps, this.minRepsFloor, this.repRange.max);
-
-    const { volumeThisWeek, volumePrevWeek } = getWeeklyVolume(logs, ctx.now, (log) => log.reps ?? 0);
-    const volumeIncreasePct = volumePrevWeek === 0 ? 0 : ((volumeThisWeek - volumePrevWeek) / volumePrevWeek) * 100;
-
-    if (volumePrevWeek > 0 && volumeIncreasePct > profile.maxWeeklyVolumeIncreasePct) {
-      nextReps = lastTarget;
-      explanation.push("Volume cap hit; holding steady.");
-    }
-
-    if (deload) {
-      nextReps = Math.max(this.minRepsFloor, Math.round(lastTarget * profile.deloadVolumeFactor));
-      explanation.push("Deload active; reducing volume.");
-    }
+    const { intensityPct, deloadActive } = getEffectiveIntensity(this, ctx.now);
+    const explanation = buildIntensityExplanation(intensityPct, deloadActive);
+    const maxCleanReps = this.baseline.maxCleanReps ?? 1;
+    let nextReps = Math.max(1, Math.round(maxCleanReps * intensityPct));
 
     return {
       metricType: "reps",
       reps: nextReps,
       explanation,
-      frozen,
-      deload,
+      deload: deloadActive,
     };
   }
 
@@ -219,10 +196,7 @@ class RepsExercise extends Exercise {
 class WeightedRepsExercise extends Exercise {
   constructor(input) {
     super(input);
-    this.repRange = input.repRange;
-    this.repIncrement = input.repIncrement ?? 1;
-    this.loadIncrementKg = input.loadIncrementKg ?? 2.5;
-    this.progressionPriority = input.progressionPriority ?? "reps_then_load";
+    this.baseline = input.baseline ?? {};
   }
 
   getPrimaryMetricType() {
@@ -232,73 +206,29 @@ class WeightedRepsExercise extends Exercise {
   validateLog(log) {
     const errors = [];
     if (log.status === "complete") {
-      if (!log.reps || log.reps <= 0) {
-        errors.push("Reps are required for a complete weighted set.");
+      if (!log.reps || log.reps < 1) {
+        errors.push("Reps must be at least 1.");
       }
       if (!log.loadKg || log.loadKg <= 0) {
-        errors.push("Load is required for a complete weighted set.");
+        errors.push("Load must be greater than 0.");
       }
     }
     return errors.length ? { valid: false, errors } : { valid: true };
   }
 
   computeNextTarget(logs, ctx) {
-    const { recentLogs, profile, explanation, frozen, deload } = getRecentCompleteLogs(
-      logs,
-      ctx,
-      this.progressionProfile
-    );
-    const recentRir = recentLogs.map((log) => log.rir).filter((rir) => rir !== undefined);
-    const medianRir = recentRir.length ? median(recentRir) : undefined;
-
-    const lastLog = recentLogs[0];
-    const lastReps = lastLog?.reps ?? this.repRange.min;
-    const lastLoad = lastLog?.loadKg ?? this.loadIncrementKg * 4;
-    let nextReps = lastReps;
-    let nextLoad = lastLoad;
-
-    if (!frozen && !deload && medianRir !== undefined) {
-      if (medianRir > profile.targetRirMax) {
-        if (lastReps < this.repRange.max) {
-          nextReps += this.repIncrement;
-          explanation.push("Effort was easy; nudging reps up.");
-        } else {
-          nextLoad += this.loadIncrementKg;
-          nextReps = this.repRange.min;
-          explanation.push("Hit top reps; adding load and resetting reps.");
-        }
-      } else if (medianRir < profile.targetRirMin) {
-        nextReps = Math.max(this.repRange.min, lastReps - this.repIncrement);
-        explanation.push("Effort was high; reducing reps.");
-      }
-    }
-
-    const { volumeThisWeek, volumePrevWeek } = getWeeklyVolume(
-      logs,
-      ctx.now,
-      (log) => (log.reps ?? 0) * (log.loadKg ?? 0)
-    );
-    const volumeIncreasePct = volumePrevWeek === 0 ? 0 : ((volumeThisWeek - volumePrevWeek) / volumePrevWeek) * 100;
-
-    if (volumePrevWeek > 0 && volumeIncreasePct > profile.maxWeeklyVolumeIncreasePct) {
-      nextReps = lastReps;
-      nextLoad = lastLoad;
-      explanation.push("Volume cap hit; holding steady.");
-    }
-
-    if (deload) {
-      nextReps = Math.max(this.repRange.min, Math.round(lastReps * profile.deloadVolumeFactor));
-      nextLoad = Math.max(this.loadIncrementKg, Math.round(lastLoad * profile.deloadVolumeFactor));
-      explanation.push("Deload active; reducing volume.");
-    }
+    const { intensityPct, deloadActive } = getEffectiveIntensity(this, ctx.now);
+    const explanation = buildIntensityExplanation(intensityPct, deloadActive);
+    const topSet = this.baseline.topSet ?? { reps: 1, loadKg: 0 };
+    const nextReps = Math.max(1, Math.round((topSet.reps ?? 1) * intensityPct));
+    const nextLoad = topSet.loadKg ?? 0;
 
     return {
       metricType: "weightedReps",
       reps: nextReps,
       loadKg: nextLoad,
       explanation,
-      frozen,
-      deload,
+      deload: deloadActive,
     };
   }
 
@@ -337,8 +267,7 @@ class WeightedRepsExercise extends Exercise {
 class IsometricExercise extends Exercise {
   constructor(input) {
     super(input);
-    this.durationRangeSec = input.durationRangeSec;
-    this.timeIncrementSec = input.timeIncrementSec ?? 5;
+    this.baseline = input.baseline ?? {};
   }
 
   getPrimaryMetricType() {
@@ -348,54 +277,22 @@ class IsometricExercise extends Exercise {
   validateLog(log) {
     const errors = [];
     if (log.status === "complete" && (!log.durationSec || log.durationSec <= 0)) {
-      errors.push("Duration is required for a complete isometric set.");
+      errors.push("Duration must be greater than 0.");
     }
     return errors.length ? { valid: false, errors } : { valid: true };
   }
 
   computeNextTarget(logs, ctx) {
-    const { recentLogs, profile, explanation, frozen, deload } = getRecentCompleteLogs(
-      logs,
-      ctx,
-      this.progressionProfile
-    );
-    const recentRir = recentLogs.map((log) => log.rir).filter((rir) => rir !== undefined);
-    const medianRir = recentRir.length ? median(recentRir) : undefined;
-
-    const lastTarget = recentLogs[0]?.durationSec ?? this.durationRangeSec.min;
-    let nextDuration = lastTarget;
-
-    if (!frozen && !deload && medianRir !== undefined) {
-      if (medianRir > profile.targetRirMax) {
-        nextDuration += this.timeIncrementSec;
-        explanation.push("Effort was easy; nudging time up.");
-      } else if (medianRir < profile.targetRirMin) {
-        nextDuration -= this.timeIncrementSec;
-        explanation.push("Effort was high; reducing time.");
-      }
-    }
-
-    nextDuration = clamp(nextDuration, this.durationRangeSec.min, this.durationRangeSec.max);
-
-    const { volumeThisWeek, volumePrevWeek } = getWeeklyVolume(logs, ctx.now, (log) => log.durationSec ?? 0);
-    const volumeIncreasePct = volumePrevWeek === 0 ? 0 : ((volumeThisWeek - volumePrevWeek) / volumePrevWeek) * 100;
-
-    if (volumePrevWeek > 0 && volumeIncreasePct > profile.maxWeeklyVolumeIncreasePct) {
-      nextDuration = lastTarget;
-      explanation.push("Volume cap hit; holding steady.");
-    }
-
-    if (deload) {
-      nextDuration = Math.max(this.durationRangeSec.min, Math.round(lastTarget * profile.deloadVolumeFactor));
-      explanation.push("Deload active; reducing volume.");
-    }
+    const { intensityPct, deloadActive } = getEffectiveIntensity(this, ctx.now);
+    const explanation = buildIntensityExplanation(intensityPct, deloadActive);
+    const maxHold = this.baseline.maxCleanHoldSec ?? 5;
+    let nextDuration = Math.max(5, Math.round(maxHold * intensityPct));
 
     return {
       metricType: "isometric",
       durationSec: nextDuration,
       explanation,
-      frozen,
-      deload,
+      deload: deloadActive,
     };
   }
 
@@ -421,39 +318,108 @@ class IsometricExercise extends Exercise {
   }
 }
 
-function hydrateExercise(record) {
-  if (record.type === "reps") return new RepsExercise(record);
-  if (record.type === "weighted") return new WeightedRepsExercise(record);
-  return new IsometricExercise(record);
+function normalizeExerciseRecord(record) {
+  const baseline = record.baseline ?? {};
+  if (record.type === "reps") {
+    baseline.maxCleanReps = baseline.maxCleanReps ?? record.repRange?.max ?? 10;
+  } else if (record.type === "weighted") {
+    baseline.topSet = baseline.topSet ?? {
+      reps: record.repRange?.max ?? 8,
+      loadKg: record.loadIncrementKg ? record.loadIncrementKg * 4 : 20,
+    };
+  } else {
+    baseline.maxCleanHoldSec = baseline.maxCleanHoldSec ?? record.durationRangeSec?.max ?? 30;
+  }
+  baseline.intensityPct = normalizeIntensity(baseline.intensityPct ?? GTG_INTENSITY_PRESETS.normal);
+  return {
+    ...record,
+    baseline,
+    deloadUntil: record.deloadUntil ?? null,
+  };
 }
 
-function getRecentCompleteLogs(logs, ctx, overrideProfile) {
-  const profile = overrideProfile ?? ctx.profile;
-  const recentLogs = logs
-    .filter((log) => log.status === "complete")
-    .filter((log) => ctx.now - log.timestamp <= 14 * DAY_MS)
+function hydrateExercise(record) {
+  const normalized = normalizeExerciseRecord(record);
+  if (normalized.type === "reps") return new RepsExercise(normalized);
+  if (normalized.type === "weighted") return new WeightedRepsExercise(normalized);
+  return new IsometricExercise(normalized);
+}
+
+function normalizeIntensity(value) {
+  if (value === undefined || Number.isNaN(value)) return GTG_INTENSITY_PRESETS.normal;
+  return clamp(value, INTENSITY_MIN, INTENSITY_MAX);
+}
+
+function getIntensityLabel(intensityPct) {
+  const rounded = Math.round(intensityPct * 100);
+  if (rounded === 40) return "Easy";
+  if (rounded === 50) return "Normal";
+  if (rounded === 60) return "Hard";
+  if (rounded === 30) return "Deload";
+  return "Auto";
+}
+
+function buildIntensityExplanation(intensityPct, deloadActive) {
+  const label = getIntensityLabel(intensityPct);
+  if (deloadActive) {
+    return ["Deload active: easy sets for recovery."];
+  }
+  return [`GTG intensity: ${label}.`];
+}
+
+function getEffectiveIntensity(exercise, now) {
+  const baselineIntensity = normalizeIntensity(exercise.baseline?.intensityPct ?? GTG_INTENSITY_PRESETS.normal);
+  const deloadActive = exercise.deloadUntil ? now < exercise.deloadUntil : false;
+  const intensityPct = deloadActive ? INTENSITY_MIN : baselineIntensity;
+  return { intensityPct, deloadActive };
+}
+
+async function adjustExerciseIntensity(exerciseId, now) {
+  const exerciseIndex = state.exercises.findIndex((item) => item.id === exerciseId);
+  if (exerciseIndex === -1) return;
+  const exercise = normalizeExerciseRecord(state.exercises[exerciseIndex]);
+  const logs = state.logs
+    .filter((log) => log.exerciseId === exerciseId && log.status === "complete")
     .sort((a, b) => b.timestamp - a.timestamp)
-    .slice(0, 30);
+    .slice(0, 3);
+  if (!logs.length) return;
 
-  const explanation = [];
-  const painFlags = logs
-    .filter((log) => log.pain0to10 !== undefined)
-    .sort((a, b) => b.timestamp - a.timestamp)
-    .slice(0, profile.freezeDaysIfPain);
+  const deloadActive = exercise.deloadUntil ? now < exercise.deloadUntil : false;
+  let nextIntensity = normalizeIntensity(exercise.baseline.intensityPct);
+  let nextDeloadUntil = exercise.deloadUntil ?? null;
 
-  const painHigh = painFlags.some((log) => (log.pain0to10 ?? 0) >= profile.painReduce);
-  const painWarnStreak =
-    painFlags.length === profile.freezeDaysIfPain &&
-    painFlags.every((log) => (log.pain0to10 ?? 0) >= profile.painWarn);
+  const painValues = logs.map((log) => log.pain0to10).filter((value) => value !== undefined);
+  const rirValues = logs.map((log) => log.rir).filter((value) => value !== undefined);
+  const hasPainHigh = painValues.some((value) => value >= 5);
 
-  const deload = painHigh || painWarnStreak;
-  const frozen = deload;
-
-  if (deload) {
-    explanation.push("Pain guardrails triggered a deload.");
+  if (hasPainHigh) {
+    nextIntensity = INTENSITY_MIN;
+    nextDeloadUntil = now + DELOAD_DAYS * DAY_MS;
+  } else if (!deloadActive) {
+    const hasPainWarn = painValues.some((value) => value >= 3);
+    const hasHighEffort = logs.some((log) => log.rir !== undefined && log.rir <= 2);
+    if (hasPainWarn || hasHighEffort) {
+      nextIntensity = Math.max(INTENSITY_MIN, nextIntensity - 0.05);
+    } else if (logs.length >= 3) {
+      const hasMissing = logs.some((log) => log.rir === undefined || log.pain0to10 === undefined);
+      const allEasy =
+        !hasMissing &&
+        logs.every((log) => log.rir !== undefined && log.rir >= 5 && log.pain0to10 !== undefined && log.pain0to10 <= 2);
+      if (allEasy && rirValues.length && painValues.length) {
+        nextIntensity = Math.min(INTENSITY_MAX, nextIntensity + 0.02);
+      }
+    }
   }
 
-  return { recentLogs, profile, explanation, frozen, deload };
+  if (nextIntensity !== exercise.baseline.intensityPct || nextDeloadUntil !== exercise.deloadUntil) {
+    const updated = {
+      ...exercise,
+      baseline: { ...exercise.baseline, intensityPct: nextIntensity },
+      deloadUntil: nextDeloadUntil,
+    };
+    state.exercises[exerciseIndex] = updated;
+    await dbPut("exercises", updated);
+  }
 }
 
 function getWeeklyVolume(logs, now, volumeFn) {
@@ -601,7 +567,14 @@ async function loadStore() {
     dbGetAll("templates"),
     dbGetAll("settings"),
   ]);
-  state.exercises = exercises;
+  state.exercises = [];
+  for (const record of exercises) {
+    const normalized = normalizeExerciseRecord(record);
+    state.exercises.push(normalized);
+    if (JSON.stringify(normalized) !== JSON.stringify(record)) {
+      await dbPut("exercises", normalized);
+    }
+  }
   state.logs = logs.sort((a, b) => b.timestamp - a.timestamp);
   state.templates = templates;
   state.settings = settings.find((item) => item.id === "app")?.value ?? defaultSettings;
@@ -627,9 +600,10 @@ async function ensureDefaults() {
       tags: [],
       variantsSchema: [],
       type: "reps",
-      repRange: { min: 6, max: 15 },
-      repIncrement: 1,
-      minRepsFloor: 1,
+      baseline: {
+        maxCleanReps: 20,
+        intensityPct: GTG_INTENSITY_PRESETS.normal,
+      },
     },
     {
       id: uuid(),
@@ -638,10 +612,10 @@ async function ensureDefaults() {
       tags: [],
       variantsSchema: [],
       type: "weighted",
-      repRange: { min: 6, max: 10 },
-      loadIncrementKg: 2.5,
-      repIncrement: 1,
-      progressionPriority: "reps_then_load",
+      baseline: {
+        topSet: { reps: 8, loadKg: 60 },
+        intensityPct: GTG_INTENSITY_PRESETS.normal,
+      },
     },
     {
       id: uuid(),
@@ -650,13 +624,16 @@ async function ensureDefaults() {
       tags: [],
       variantsSchema: [],
       type: "isometric",
-      durationRangeSec: { min: 20, max: 60 },
-      timeIncrementSec: 5,
+      baseline: {
+        maxCleanHoldSec: 60,
+        intensityPct: GTG_INTENSITY_PRESETS.normal,
+      },
     },
   ];
   for (const exercise of starterExercises) {
-    state.exercises.push(exercise);
-    await dbPut("exercises", exercise);
+    const normalized = normalizeExerciseRecord(exercise);
+    state.exercises.push(normalized);
+    await dbPut("exercises", normalized);
   }
 }
 
@@ -733,6 +710,10 @@ function renderToday() {
   const todayLogs = state.logs.filter(
     (log) => new Date(log.timestamp).toDateString() === new Date().toDateString()
   );
+  const canLog = nextTargets.length > 0;
+  const emptyMessage = !hasExercises
+    ? "No exercises yet. Add one in Settings to start logging."
+    : "Create an exercise or template to get started.";
 
   const progressWidth = state.settings.dailySetGoal
     ? Math.min(100, (todayLogs.length / state.settings.dailySetGoal) * 100)
@@ -764,7 +745,7 @@ function renderToday() {
 
       <section class="card">
         <h2>Next Set</h2>
-        ${nextTargets.length === 0 ? `<p class="muted">Create an exercise or template to get started.</p>` : `
+        ${nextTargets.length === 0 ? `<p class="muted">${emptyMessage}</p>` : `
           <div class="next-set-grid">
             ${nextTargets.map(({ exercise, target }) => `
               <div class="next-set-item">
@@ -780,8 +761,8 @@ function renderToday() {
           </div>
         `}
         <div class="button-row">
-          <button class="btn primary" data-action="quick-log" ${nextTargets.length ? "" : "disabled"}>Quick Log</button>
-          <button class="btn secondary" data-action="detail-log" ${nextTargets.length ? "" : "disabled"}>Detailed Log</button>
+          <button class="btn primary" data-action="quick-log" ${canLog ? "" : "disabled"}>Quick Log</button>
+          <button class="btn secondary" data-action="detail-log" ${canLog ? "" : "disabled"}>Detailed Log</button>
           <button class="btn ghost" data-action="undo-log" ${state.logs.length ? "" : "disabled"}>Undo last log</button>
         </div>
       </section>
@@ -983,33 +964,42 @@ function renderSettings() {
             `).join("")}
           </select>
         </label>
-        ${(state.exerciseType ?? "reps") !== "isometric" ? `
-          <div class="field-grid">
-            <label class="field">Rep min
-              <input type="number" data-field="rep-min" value="${state.repMin ?? 6}" />
-            </label>
-            <label class="field">Rep max
-              <input type="number" data-field="rep-max" value="${state.repMax ?? 12}" />
-            </label>
-          </div>
-        ` : ""}
-        ${(state.exerciseType ?? "reps") === "weighted" ? `
-          <label class="field">Load increment (kg)
-            <input type="number" data-field="load-increment" value="${state.loadIncrement ?? 2.5}" />
+        <div class="card-subtitle">Setup / Baseline</div>
+        ${(state.exerciseType ?? "reps") === "reps" ? `
+          <label class="field">Max clean reps
+            <input type="number" min="1" data-field="baseline-max-reps" value="${state.maxCleanReps ?? ""}" required />
           </label>
         ` : ""}
         ${(state.exerciseType ?? "reps") === "isometric" ? `
+          <label class="field">Max clean hold (seconds)
+            <input type="number" min="1" data-field="baseline-max-hold" value="${state.maxCleanHoldSec ?? ""}" required />
+          </label>
+        ` : ""}
+        ${(state.exerciseType ?? "reps") === "weighted" ? `
           <div class="field-grid">
-            <label class="field">Duration min (sec)
-              <input type="number" data-field="duration-min" value="${state.durationMin ?? 20}" />
+            <label class="field">Top set reps
+              <input type="number" min="1" data-field="baseline-top-reps" value="${state.topSetReps ?? ""}" required />
             </label>
-            <label class="field">Duration max (sec)
-              <input type="number" data-field="duration-max" value="${state.durationMax ?? 60}" />
-            </label>
-            <label class="field">Increment (sec)
-              <input type="number" data-field="time-increment" value="${state.timeIncrement ?? 5}" />
+            <label class="field">Top set kg
+              <input type="number" min="1" step="0.5" data-field="baseline-top-load" value="${state.topSetLoadKg ?? ""}" required />
             </label>
           </div>
+        ` : ""}
+        <label class="field">GTG intensity
+          <select data-field="intensity-preset">
+            ${["easy", "normal", "hard"].map((value) => `
+              <option value="${value}" ${value === (state.intensityPreset ?? "normal") ? "selected" : ""}>${value.charAt(0).toUpperCase() + value.slice(1)}</option>
+            `).join("")}
+          </select>
+        </label>
+        <label class="field field-inline">
+          <input type="checkbox" data-field="intensity-advanced" ${state.intensityAdvanced ? "checked" : ""} />
+          <span>Advanced intensity</span>
+        </label>
+        ${state.intensityAdvanced ? `
+          <label class="field">Intensity (0.30 - 0.70)
+            <input type="number" min="0.3" max="0.7" step="0.01" data-field="intensity-value" value="${state.intensityPct ?? GTG_INTENSITY_PRESETS.normal}" />
+          </label>
         ` : ""}
         <div class="button-row">
           <button class="btn secondary" data-action="add-variant">Add Variant Field</button>
@@ -1411,39 +1401,52 @@ function bindEvents() {
     };
   });
 
-  document.querySelectorAll("[data-field=rep-min]").forEach((input) => {
+  document.querySelectorAll("[data-field=baseline-max-reps]").forEach((input) => {
     input.oninput = (event) => {
-      state.repMin = Number(event.target.value);
+      state.maxCleanReps = Number(event.target.value);
     };
   });
 
-  document.querySelectorAll("[data-field=rep-max]").forEach((input) => {
+  document.querySelectorAll("[data-field=baseline-max-hold]").forEach((input) => {
     input.oninput = (event) => {
-      state.repMax = Number(event.target.value);
+      state.maxCleanHoldSec = Number(event.target.value);
     };
   });
 
-  document.querySelectorAll("[data-field=load-increment]").forEach((input) => {
+  document.querySelectorAll("[data-field=baseline-top-reps]").forEach((input) => {
     input.oninput = (event) => {
-      state.loadIncrement = Number(event.target.value);
+      state.topSetReps = Number(event.target.value);
     };
   });
 
-  document.querySelectorAll("[data-field=duration-min]").forEach((input) => {
+  document.querySelectorAll("[data-field=baseline-top-load]").forEach((input) => {
     input.oninput = (event) => {
-      state.durationMin = Number(event.target.value);
+      state.topSetLoadKg = Number(event.target.value);
     };
   });
 
-  document.querySelectorAll("[data-field=duration-max]").forEach((input) => {
-    input.oninput = (event) => {
-      state.durationMax = Number(event.target.value);
+  document.querySelectorAll("[data-field=intensity-preset]").forEach((select) => {
+    select.onchange = (event) => {
+      state.intensityPreset = event.target.value;
+      if (!state.intensityAdvanced) {
+        state.intensityPct = GTG_INTENSITY_PRESETS[state.intensityPreset] ?? GTG_INTENSITY_PRESETS.normal;
+      }
     };
   });
 
-  document.querySelectorAll("[data-field=time-increment]").forEach((input) => {
+  document.querySelectorAll("[data-field=intensity-advanced]").forEach((input) => {
+    input.onchange = (event) => {
+      state.intensityAdvanced = event.target.checked;
+      if (!state.intensityAdvanced) {
+        state.intensityPct = GTG_INTENSITY_PRESETS[state.intensityPreset ?? "normal"] ?? GTG_INTENSITY_PRESETS.normal;
+      }
+      render();
+    };
+  });
+
+  document.querySelectorAll("[data-field=intensity-value]").forEach((input) => {
     input.oninput = (event) => {
-      state.timeIncrement = Number(event.target.value);
+      state.intensityPct = Number(event.target.value);
     };
   });
 
@@ -1454,11 +1457,36 @@ function bindEvents() {
   });
 }
 
+function getSelectionForLogging() {
+  if (state.mode === "template") {
+    if (!state.selectedTemplateId && state.templates.length > 0) {
+      state.selectedTemplateId = state.templates[0].id;
+    }
+    if (state.selectedTemplateId && !state.templates.find((template) => template.id === state.selectedTemplateId)) {
+      state.selectedTemplateId = state.templates[0]?.id ?? null;
+    }
+    return state.templates.find((template) => template.id === state.selectedTemplateId)?.items ?? [];
+  }
+  if (!state.selectedExerciseId && state.exercises.length > 0) {
+    state.selectedExerciseId = state.exercises[0].id;
+  }
+  if (state.selectedExerciseId && !state.exercises.find((exercise) => exercise.id === state.selectedExerciseId)) {
+    state.selectedExerciseId = state.exercises[0]?.id ?? null;
+  }
+  return state.selectedExerciseId ? [{ exerciseId: state.selectedExerciseId }] : [];
+}
+
 async function quickLog() {
+  if (!state.exercises.length) {
+    toast("Add an exercise before logging.");
+    return;
+  }
   const exercises = state.exercises.map(hydrateExercise);
-  const selection = state.mode === "template"
-    ? (state.templates.find((template) => template.id === state.selectedTemplateId)?.items ?? [])
-    : [{ exerciseId: state.selectedExerciseId }];
+  const selection = getSelectionForLogging();
+  if (!selection.length) {
+    toast("Select an exercise or template to log.");
+    return;
+  }
 
   const quickLogs = [];
   for (const item of selection) {
@@ -1482,9 +1510,18 @@ async function quickLog() {
       durationSec: target.durationSec,
       status: "complete",
     };
+    const validation = exercise.validateLog(log);
+    if (!validation.valid) {
+      toast(validation.errors?.[0] ?? "Invalid log.");
+      return;
+    }
     await dbPut("logs", log);
     state.logs.unshift(log);
     quickLogs.push(log);
+  }
+  if (!quickLogs.length) {
+    toast("Nothing to log yet.");
+    return;
   }
   toast("Logged! Add RIR/pain or skip.");
   state.quickCheckLogs = quickLogs;
@@ -1492,73 +1529,127 @@ async function quickLog() {
   renderQuickCheck();
 }
 
+function closeModal() {
+  const modal = document.querySelector(".modal-backdrop");
+  if (modal) modal.remove();
+}
+
+function openModal({ title, body, footer, onClose }) {
+  closeModal();
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <div class="modal-card" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <h2>${title}</h2>
+        <button class="modal-close" data-modal-close type="button" aria-label="Close">×</button>
+      </div>
+      <div class="modal-content">
+        ${body}
+      </div>
+      <div class="modal-footer">
+        <div class="button-row">
+          ${footer}
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+  backdrop.querySelector("[data-modal-close]").onclick = () => {
+    closeModal();
+    onClose?.();
+  };
+  backdrop.onclick = (event) => {
+    if (event.target === backdrop) {
+      closeModal();
+      onClose?.();
+    }
+  };
+  return backdrop;
+}
+
 function renderQuickCheck() {
   const logs = state.quickCheckLogs ?? [];
   if (!logs.length) return;
-  const overlay = document.createElement("div");
-  overlay.className = "card";
-  overlay.innerHTML = `
-    <h2>RIR & Pain Check</h2>
-    <div class="log-list">
-      ${logs.map((log, index) => {
-        const exercise = state.exercises.find((item) => item.id === log.exerciseId);
-        return `
-          <div class="log-item">
-            <div class="log-detail">
-              <strong>${exercise?.name ?? "Unknown"}</strong>
-              <label>RIR
-                <input type="range" min="0" max="10" value="${log.rir ?? 5}" data-quick-rir="${index}" />
-              </label>
-              <label>Pain
-                <input type="range" min="0" max="10" value="${log.pain0to10 ?? 0}" data-quick-pain="${index}" />
-              </label>
+  const modal = openModal({
+    title: "RIR & Pain Check",
+    body: `
+      <div class="log-list">
+        ${logs.map((log, index) => {
+          const exercise = state.exercises.find((item) => item.id === log.exerciseId);
+          return `
+            <div class="log-item">
+              <div class="log-detail">
+                <strong>${exercise?.name ?? "Unknown"}</strong>
+                <label>RIR
+                  <input type="range" min="0" max="10" value="${log.rir ?? 5}" data-quick-rir="${index}" />
+                </label>
+                <label>Pain
+                  <input type="range" min="0" max="10" value="${log.pain0to10 ?? 0}" data-quick-pain="${index}" />
+                </label>
+              </div>
             </div>
-          </div>
-        `;
-      }).join("")}
-    </div>
-    <div class="button-row">
+          `;
+        }).join("")}
+      </div>
+    `,
+    footer: `
       <button class="btn primary" data-quick-action="save">Save</button>
       <button class="btn ghost" data-quick-action="skip">Skip</button>
-    </div>
-  `;
-  const main = document.querySelector(".app-main");
-  main.appendChild(overlay);
+    `,
+    onClose: () => {
+      state.quickCheckLogs = [];
+      render();
+    },
+  });
 
-  overlay.querySelectorAll("input[data-quick-rir]").forEach((input) => {
+  modal.querySelectorAll("input[data-quick-rir]").forEach((input) => {
     input.oninput = (event) => {
       const index = Number(event.target.dataset.quickRir);
       state.quickCheckLogs[index].rir = Number(event.target.value);
     };
   });
 
-  overlay.querySelectorAll("input[data-quick-pain]").forEach((input) => {
+  modal.querySelectorAll("input[data-quick-pain]").forEach((input) => {
     input.oninput = (event) => {
       const index = Number(event.target.dataset.quickPain);
       state.quickCheckLogs[index].pain0to10 = Number(event.target.value);
     };
   });
 
-  overlay.querySelector("button[data-quick-action=save]").onclick = async () => {
+  modal.querySelector("button[data-quick-action=save]").onclick = async () => {
+    const exerciseIds = new Set();
     for (const log of state.quickCheckLogs) {
       await dbPut("logs", log);
+      exerciseIds.add(log.exerciseId);
     }
     state.quickCheckLogs = [];
     toast("RIR and pain saved.");
+    closeModal();
+    for (const exerciseId of exerciseIds) {
+      await adjustExerciseIntensity(exerciseId, Date.now());
+    }
     render();
   };
 
-  overlay.querySelector("button[data-quick-action=skip]").onclick = () => {
+  modal.querySelector("button[data-quick-action=skip]").onclick = () => {
     state.quickCheckLogs = [];
+    closeModal();
     render();
   };
 }
 
 function openDetailLog() {
+  if (!state.exercises.length) {
+    toast("Add an exercise before logging.");
+    return;
+  }
   const exercises = state.exercises.map(hydrateExercise);
-  const selection = state.mode === "template"
-    ? (state.templates.find((template) => template.id === state.selectedTemplateId)?.items ?? [])
-    : [{ exerciseId: state.selectedExerciseId }];
+  const selection = getSelectionForLogging();
+  if (!selection.length) {
+    toast("Select an exercise or template to log.");
+    return;
+  }
 
   const detailLogs = selection
     .map((item) => {
@@ -1587,38 +1678,40 @@ function openDetailLog() {
       };
     })
     .filter(Boolean);
+  if (!detailLogs.length) {
+    toast("No exercises found to log.");
+    return;
+  }
 
-  const overlay = document.createElement("div");
-  overlay.className = "card";
-  overlay.innerHTML = `
-    <h2>Detailed Log</h2>
-    <div class="log-list">
-      ${detailLogs.map(({ exercise, log }, index) => `
-        <div class="log-item">
-          <div class="log-detail">
-            <strong>${exercise.name}</strong>
-            ${exercise.type === "isometric" ? `
-              <input type="number" value="${log.durationSec ?? 0}" data-detail="${index}" data-metric="duration" />
-            ` : `
-              <input type="number" value="${log.reps ?? 0}" data-detail="${index}" data-metric="reps" />
-              ${exercise.type === "weighted" ? `<input type="number" value="${log.loadKg ?? 0}" data-detail="${index}" data-metric="load" />` : ""}
-            `}
-            <input type="number" placeholder="RIR" value="${log.rir ?? ""}" data-detail="${index}" data-metric="rir" />
-            <input type="number" placeholder="Pain" value="${log.pain0to10 ?? ""}" data-detail="${index}" data-metric="pain" />
+  const modal = openModal({
+    title: "Detailed Log",
+    body: `
+      <div class="log-list">
+        ${detailLogs.map(({ exercise, log }, index) => `
+          <div class="log-item">
+            <div class="log-detail">
+              <strong>${exercise.name}</strong>
+              ${exercise.type === "isometric" ? `
+                <input type="number" value="${log.durationSec ?? 0}" data-detail="${index}" data-metric="duration" />
+              ` : `
+                <input type="number" value="${log.reps ?? 0}" data-detail="${index}" data-metric="reps" />
+                ${exercise.type === "weighted" ? `<input type="number" value="${log.loadKg ?? 0}" data-detail="${index}" data-metric="load" />` : ""}
+              `}
+              <input type="number" placeholder="RIR" value="${log.rir ?? ""}" data-detail="${index}" data-metric="rir" />
+              <input type="number" placeholder="Pain" value="${log.pain0to10 ?? ""}" data-detail="${index}" data-metric="pain" />
+            </div>
           </div>
-        </div>
-      `).join("")}
-    </div>
-    <div class="button-row">
+        `).join("")}
+      </div>
+    `,
+    footer: `
       <button class="btn primary" data-detail-action="save">Save</button>
       <button class="btn ghost" data-detail-action="cancel">Cancel</button>
-    </div>
-  `;
+    `,
+    onClose: () => render(),
+  });
 
-  const main = document.querySelector(".app-main");
-  main.appendChild(overlay);
-
-  overlay.querySelectorAll("[data-detail]").forEach((input) => {
+  modal.querySelectorAll("[data-detail]").forEach((input) => {
     input.oninput = (event) => {
       const index = Number(event.target.dataset.detail);
       const metric = event.target.dataset.metric;
@@ -1631,17 +1724,29 @@ function openDetailLog() {
     };
   });
 
-  overlay.querySelector("button[data-detail-action=save]").onclick = async () => {
+  modal.querySelector("button[data-detail-action=save]").onclick = async () => {
+    for (const entry of detailLogs) {
+      const validation = entry.exercise.validateLog(entry.log);
+      if (!validation.valid) {
+        toast(validation.errors?.[0] ?? "Invalid log.");
+        return;
+      }
+    }
     for (const entry of detailLogs) {
       const log = entry.log;
       await dbPut("logs", log);
       state.logs.unshift(log);
+      await adjustExerciseIntensity(log.exerciseId, Date.now());
     }
     toast("Detailed log saved.");
+    closeModal();
     render();
   };
 
-  overlay.querySelector("button[data-detail-action=cancel]").onclick = () => render();
+  modal.querySelector("button[data-detail-action=cancel]").onclick = () => {
+    closeModal();
+    render();
+  };
 }
 
 async function undoLog() {
@@ -1661,6 +1766,9 @@ async function deleteLog(id) {
 
 async function saveExercise() {
   if (!state.exerciseName?.trim()) return;
+  const intensityPreset = state.intensityPreset ?? "normal";
+  const presetIntensity = GTG_INTENSITY_PRESETS[intensityPreset] ?? GTG_INTENSITY_PRESETS.normal;
+  const intensityPct = state.intensityAdvanced ? normalizeIntensity(state.intensityPct) : presetIntensity;
   const base = {
     id: uuid(),
     name: state.exerciseName.trim(),
@@ -1671,34 +1779,54 @@ async function saveExercise() {
 
   let record;
   if ((state.exerciseType ?? "reps") === "weighted") {
+    if (!state.topSetReps || state.topSetReps < 1 || !state.topSetLoadKg || state.topSetLoadKg <= 0) {
+      toast("Enter a valid top set (reps + kg).");
+      return;
+    }
     record = {
       ...base,
       type: "weighted",
-      repRange: { min: state.repMin ?? 6, max: state.repMax ?? 12 },
-      repIncrement: 1,
-      loadIncrementKg: state.loadIncrement ?? 2.5,
-      progressionPriority: "reps_then_load",
+      baseline: {
+        topSet: { reps: state.topSetReps, loadKg: state.topSetLoadKg },
+        intensityPct,
+      },
     };
   } else if ((state.exerciseType ?? "reps") === "isometric") {
+    if (!state.maxCleanHoldSec || state.maxCleanHoldSec < 1) {
+      toast("Enter a valid max clean hold.");
+      return;
+    }
     record = {
       ...base,
       type: "isometric",
-      durationRangeSec: { min: state.durationMin ?? 20, max: state.durationMax ?? 60 },
-      timeIncrementSec: state.timeIncrement ?? 5,
+      baseline: {
+        maxCleanHoldSec: state.maxCleanHoldSec,
+        intensityPct,
+      },
     };
   } else {
+    if (!state.maxCleanReps || state.maxCleanReps < 1) {
+      toast("Enter a valid max clean reps.");
+      return;
+    }
     record = {
       ...base,
       type: "reps",
-      repRange: { min: state.repMin ?? 6, max: state.repMax ?? 12 },
-      repIncrement: 1,
-      minRepsFloor: 1,
+      baseline: {
+        maxCleanReps: state.maxCleanReps,
+        intensityPct,
+      },
     };
   }
 
-  await dbPut("exercises", record);
-  state.exercises.push(record);
+  const normalized = normalizeExerciseRecord(record);
+  await dbPut("exercises", normalized);
+  state.exercises.push(normalized);
   state.exerciseName = "";
+  state.maxCleanReps = "";
+  state.maxCleanHoldSec = "";
+  state.topSetReps = "";
+  state.topSetLoadKg = "";
   toast("Exercise saved.");
   render();
 }
@@ -1751,33 +1879,71 @@ async function deleteTemplate(id) {
 
 function exportCsv() {
   const logs = state.logs.filter((log) => log.exerciseId === (state.selectedExerciseId ?? state.exercises[0]?.id));
-  const header = ["timestamp", "exerciseId", "reps", "loadKg", "durationSec", "rir", "pain0to10", "status"];
-  const rows = logs.map((log) => [
-    log.timestamp,
-    log.exerciseId,
-    log.reps ?? "",
-    log.loadKg ?? "",
-    log.durationSec ?? "",
-    log.rir ?? "",
-    log.pain0to10 ?? "",
-    log.status,
-  ]);
+  const exerciseMap = new Map(state.exercises.map((exercise) => [exercise.id, exercise]));
+  const header = [
+    "timestamp",
+    "exerciseId",
+    "reps",
+    "loadKg",
+    "durationSec",
+    "rir",
+    "pain0to10",
+    "status",
+    "baselineIntensityPct",
+    "deloadActive",
+  ];
+  const rows = logs.map((log) => {
+    const exercise = exerciseMap.get(log.exerciseId);
+    const intensity = exercise?.baseline?.intensityPct;
+    const deloadActive = exercise?.deloadUntil ? Date.now() < exercise.deloadUntil : false;
+    return [
+      log.timestamp,
+      log.exerciseId,
+      log.reps ?? "",
+      log.loadKg ?? "",
+      log.durationSec ?? "",
+      log.rir ?? "",
+      log.pain0to10 ?? "",
+      log.status,
+      intensity ?? "",
+      deloadActive,
+    ];
+  });
   const csv = [header, ...rows].map((row) => row.join(",")).join("\n");
   downloadFile("dojo-logs.csv", csv);
 }
 
 function exportGlobalCsv() {
-  const header = ["timestamp", "exerciseId", "reps", "loadKg", "durationSec", "rir", "pain0to10", "status"];
-  const rows = state.logs.map((log) => [
-    log.timestamp,
-    log.exerciseId,
-    log.reps ?? "",
-    log.loadKg ?? "",
-    log.durationSec ?? "",
-    log.rir ?? "",
-    log.pain0to10 ?? "",
-    log.status,
-  ]);
+  const exerciseMap = new Map(state.exercises.map((exercise) => [exercise.id, exercise]));
+  const header = [
+    "timestamp",
+    "exerciseId",
+    "reps",
+    "loadKg",
+    "durationSec",
+    "rir",
+    "pain0to10",
+    "status",
+    "baselineIntensityPct",
+    "deloadActive",
+  ];
+  const rows = state.logs.map((log) => {
+    const exercise = exerciseMap.get(log.exerciseId);
+    const intensity = exercise?.baseline?.intensityPct;
+    const deloadActive = exercise?.deloadUntil ? Date.now() < exercise.deloadUntil : false;
+    return [
+      log.timestamp,
+      log.exerciseId,
+      log.reps ?? "",
+      log.loadKg ?? "",
+      log.durationSec ?? "",
+      log.rir ?? "",
+      log.pain0to10 ?? "",
+      log.status,
+      intensity ?? "",
+      deloadActive,
+    ];
+  });
   const csv = [header, ...rows].map((row) => row.join(",")).join("\n");
   downloadFile("dojo-all-logs.csv", csv);
 }
@@ -1798,9 +1964,11 @@ async function importJson(file) {
   try {
     const data = JSON.parse(text);
     if (data.exercises) {
-      state.exercises = data.exercises;
+      state.exercises = [];
       for (const exercise of data.exercises) {
-        await dbPut("exercises", exercise);
+        const normalized = normalizeExerciseRecord(exercise);
+        state.exercises.push(normalized);
+        await dbPut("exercises", normalized);
       }
     }
     if (data.logs) {
@@ -1827,11 +1995,23 @@ async function importJson(file) {
 
 async function resetAll() {
   if (!confirm("Reset all data? This cannot be undone.")) return;
+  const db = await dbPromise;
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction(["exercises", "logs", "templates", "settings"], "readwrite");
+    transaction.objectStore("exercises").clear();
+    transaction.objectStore("logs").clear();
+    transaction.objectStore("templates").clear();
+    transaction.objectStore("settings").clear();
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => reject(transaction.error);
+  });
   state.exercises = [];
   state.logs = [];
   state.templates = [];
   state.templateItems = [];
   state.variantFields = [];
+  state.selectedExerciseId = null;
+  state.selectedTemplateId = null;
   await saveSettings({ ...defaultSettings });
   await ensureDefaults();
   render();
@@ -1856,12 +2036,13 @@ if ("serviceWorker" in navigator) {
 state.mode = "single";
 state.exerciseType = "reps";
 state.exerciseCategory = "pull";
-state.repMin = 6;
-state.repMax = 12;
-state.loadIncrement = 2.5;
-state.durationMin = 20;
-state.durationMax = 60;
-state.timeIncrement = 5;
+state.maxCleanReps = "";
+state.maxCleanHoldSec = "";
+state.topSetReps = "";
+state.topSetLoadKg = "";
+state.intensityPreset = "normal";
+state.intensityAdvanced = false;
+state.intensityPct = GTG_INTENSITY_PRESETS.normal;
 state.variantFields = [];
 state.templateItems = [];
 state.templateName = "";
