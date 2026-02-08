@@ -465,7 +465,7 @@ function applyTheme() {
 }
 
 const dbPromise = new Promise((resolve, reject) => {
-  const request = indexedDB.open("dojo-db", 1);
+  const request = indexedDB.open("dojo-db", 2);
   request.onupgradeneeded = (event) => {
     const db = event.target.result;
     if (!db.objectStoreNames.contains("exercises")) {
@@ -479,9 +479,10 @@ const dbPromise = new Promise((resolve, reject) => {
     if (!db.objectStoreNames.contains("templates")) {
       db.createObjectStore("templates", { keyPath: "id" });
     }
-    if (!db.objectStoreNames.contains("settings")) {
-      db.createObjectStore("settings");
+    if (db.objectStoreNames.contains("settings")) {
+      db.deleteObjectStore("settings");
     }
+    db.createObjectStore("settings", { keyPath: "id" });
   };
   request.onsuccess = () => resolve(request.result);
   request.onerror = () => reject(request.error);
@@ -529,6 +530,7 @@ async function loadStore() {
   state.logs = logs.sort((a, b) => b.timestamp - a.timestamp);
   state.templates = templates;
   state.settings = settings.find((item) => item.id === "app")?.value ?? defaultSettings;
+  await ensureDefaults();
   applyTheme();
   render();
 }
@@ -540,7 +542,7 @@ async function saveSettings(settings) {
   render();
 }
 
-function ensureDefaults() {
+async function ensureDefaults() {
   if (state.exercises.length > 0) return;
   const starterExercises = [
     {
@@ -577,10 +579,10 @@ function ensureDefaults() {
       timeIncrementSec: 5,
     },
   ];
-  starterExercises.forEach((exercise) => {
+  for (const exercise of starterExercises) {
     state.exercises.push(exercise);
-    dbPut("exercises", exercise);
-  });
+    await dbPut("exercises", exercise);
+  }
 }
 
 function renderHeader() {
@@ -621,19 +623,24 @@ function renderToday() {
   const exercises = state.exercises.map(hydrateExercise);
   const selectedExerciseId = state.selectedExerciseId ?? state.exercises[0]?.id ?? "";
   const selectedTemplateId = state.selectedTemplateId ?? state.templates[0]?.id ?? "";
+  const hasExercises = state.exercises.length > 0;
+  const hasTemplates = state.templates.length > 0;
+  const templateItems = state.templates.find((template) => template.id === selectedTemplateId)?.items ?? [];
+  const isTemplateMode = state.mode === "template";
 
-  const selectionExercises = state.mode === "template"
-    ? state.templates
-        .find((template) => template.id === selectedTemplateId)?.items
+  const selectionExercises = isTemplateMode
+    ? templateItems
         .map((item) => ({
           exercise: exercises.find((exercise) => exercise.id === item.exerciseId),
           templateItem: item,
         }))
         .filter((item) => item.exercise)
-    : [{
-        exercise: exercises.find((exercise) => exercise.id === selectedExerciseId),
-        templateItem: null,
-      }];
+    : (hasExercises && selectedExerciseId
+      ? [{
+          exercise: exercises.find((exercise) => exercise.id === selectedExerciseId),
+          templateItem: null,
+        }].filter((item) => item.exercise)
+      : []);
 
   const nextTargets = selectionExercises.map(({ exercise, templateItem }) => {
     const logs = state.logs.filter((log) => log.exerciseId === exercise.id);
@@ -663,18 +670,20 @@ function renderToday() {
           <button class="mode-button ${state.mode !== "template" ? "active" : ""}" data-mode="single">Single Exercise</button>
           <button class="mode-button ${state.mode === "template" ? "active" : ""}" data-mode="template">Template</button>
         </div>
-        ${state.mode === "template" ? `
+        ${isTemplateMode ? `
           <label class="field">Template
             <select data-field="template">
               ${state.templates.map((template) => `<option value="${template.id}" ${template.id === selectedTemplateId ? "selected" : ""}>${template.name}</option>`).join("")}
             </select>
           </label>
+          ${hasTemplates ? "" : `<p class="muted">No templates yet. Create one to get started.</p>`}
         ` : `
           <label class="field">Exercise
             <select data-field="exercise">
               ${state.exercises.map((exercise) => `<option value="${exercise.id}" ${exercise.id === selectedExerciseId ? "selected" : ""}>${exercise.name}</option>`).join("")}
             </select>
           </label>
+          ${hasExercises ? "" : `<p class="muted">No exercises yet. Add one to get started.</p>`}
         `}
       </section>
 
@@ -1373,7 +1382,7 @@ function bindEvents() {
 async function quickLog() {
   const exercises = state.exercises.map(hydrateExercise);
   const selection = state.mode === "template"
-    ? state.templates.find((template) => template.id === state.selectedTemplateId)?.items
+    ? (state.templates.find((template) => template.id === state.selectedTemplateId)?.items ?? [])
     : [{ exerciseId: state.selectedExerciseId }];
 
   const quickLogs = [];
@@ -1473,7 +1482,7 @@ function renderQuickCheck() {
 function openDetailLog() {
   const exercises = state.exercises.map(hydrateExercise);
   const selection = state.mode === "template"
-    ? state.templates.find((template) => template.id === state.selectedTemplateId)?.items
+    ? (state.templates.find((template) => template.id === state.selectedTemplateId)?.items ?? [])
     : [{ exerciseId: state.selectedExerciseId }];
 
   const detailLogs = selection
@@ -1749,7 +1758,7 @@ async function resetAll() {
   state.templateItems = [];
   state.variantFields = [];
   await saveSettings({ ...defaultSettings });
-  ensureDefaults();
+  await ensureDefaults();
   render();
 }
 
@@ -1787,7 +1796,4 @@ state.selectedTemplateId = null;
 state.windowDays = 30;
 state.completeOnly = true;
 
-loadStore().then(() => {
-  ensureDefaults();
-  render();
-});
+loadStore();
