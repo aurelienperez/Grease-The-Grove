@@ -92,12 +92,27 @@ body {
   font-size: 1.2rem;
 }
 
+.card-subtitle {
+  font-size: 0.95rem;
+  font-weight: 700;
+  margin: 12px 0 8px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .field {
   display: flex;
   flex-direction: column;
   gap: 6px;
   margin-bottom: 12px;
   font-size: 0.9rem;
+}
+
+.field-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
 }
 
 .field input,
@@ -325,6 +340,61 @@ input:focus-visible,
   padding: 10px 14px;
   border: 1px solid var(--border);
   box-shadow: 0 10px 20px var(--shadow);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(12, 15, 24, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 999;
+}
+
+.modal-card {
+  width: min(560px, 100%);
+  max-height: min(90vh, 720px);
+  background: var(--surface);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  box-shadow: 0 20px 40px var(--shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.modal-close {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.5rem;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.modal-content {
+  padding: 16px 20px;
+  overflow-y: auto;
+}
+
+.modal-footer {
+  padding: 16px 20px 20px;
+  border-top: 1px solid var(--border);
 }
 
 .toggle {
